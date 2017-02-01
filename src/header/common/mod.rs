@@ -51,6 +51,7 @@ pub use self::preference_applied::PreferenceApplied;
 pub use self::range::{Range, ByteRangeSpec};
 pub use self::referer::Referer;
 pub use self::referrer_policy::ReferrerPolicy;
+pub use self::retry_after::RetryAfter;
 pub use self::server::Server;
 pub use self::set_cookie::SetCookie;
 pub use self::strict_transport_security::StrictTransportSecurity;
@@ -84,9 +85,8 @@ macro_rules! bench_header(
             fn bench_format(b: &mut Bencher) {
                 let raw = $value.into();
                 let val: $ty = Header::parse_header(&raw).unwrap();
-                let fmt = ::header::HeaderFormatter(&val);
                 b.iter(|| {
-                    format!("{}", fmt);
+                    format!("{}", val);
                 });
             }
         }
@@ -384,6 +384,7 @@ mod preference_applied;
 mod range;
 mod referer;
 mod referrer_policy;
+mod retry_after;
 mod server;
 mod set_cookie;
 mod strict_transport_security;

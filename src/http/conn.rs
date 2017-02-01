@@ -97,6 +97,7 @@ impl<I: Io, T: Http1Transaction, K: KeepAlive> Conn<I, T, K> {
                             other => Err(io::Error::new(io::ErrorKind::UnexpectedEof, other)),
                         }
                     } else {
+                        debug!("socket complete");
                         Ok(Async::Ready(None))
                     }
                 };
@@ -591,6 +592,21 @@ mod tests {
                 })
             },
             f => panic!("frame is not Frame::Message: {:?}", f)
+        }
+    }
+
+    #[test]
+    fn test_conn_parse_partial() {
+        let good_message = b"GET / HTTP/1.1\r\nHost: foo.bar\r\n\r\n".to_vec();
+        let io = AsyncIo::new_buf(good_message, 10);
+        let mut conn = Conn::<_, ServerTransaction>::new(io, Default::default());
+        assert!(conn.poll().unwrap().is_not_ready());
+        conn.io.io_mut().block_in(50);
+        let async = conn.poll().unwrap();
+        assert!(async.is_ready());
+        match async {
+            Async::Ready(Some(Frame::Message { .. })) => (),
+            f => panic!("frame is not Message: {:?}", f),
         }
     }
 

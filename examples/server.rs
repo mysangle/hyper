@@ -1,14 +1,11 @@
-//#![deny(warnings)]
+#![deny(warnings)]
 extern crate futures;
 extern crate hyper;
 extern crate pretty_env_logger;
-#[macro_use]
-extern crate log;
 
 use hyper::{Get, Post, StatusCode};
 use hyper::header::ContentLength;
-use hyper::server::{Server, Service, Request, Response};
-
+use hyper::server::{Http, Service, Request, Response};
 
 static INDEX: &'static [u8] = b"Try POST /echo";
 
@@ -48,10 +45,8 @@ impl Service for Echo {
 fn main() {
     pretty_env_logger::init().unwrap();
     let addr = "127.0.0.1:1337".parse().unwrap();
-    let (listening, server) = Server::standalone(|tokio| {
-        Server::http(&addr, tokio)?
-            .handle(|| Ok(Echo), tokio)
-    }).unwrap();
-    println!("Listening on http://{}", listening);
-    server.run();
+
+    let server = Http::new().bind(&addr, || Ok(Echo)).unwrap();
+    println!("Listening on http://{}", server.local_addr().unwrap());
+    server.run().unwrap();
 }
