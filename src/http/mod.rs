@@ -2,6 +2,8 @@
 use std::borrow::Cow;
 use std::fmt;
 
+use bytes::BytesMut;
+
 use header::{Connection, ConnectionOption};
 use header::Headers;
 use method::Method;
@@ -13,16 +15,15 @@ use version::HttpVersion::{Http10, Http11};
 pub use self::conn::{Conn, KeepAlive, KA};
 pub use self::body::{Body, TokioBody};
 pub use self::chunk::Chunk;
-use self::buf::MemBuf;
+pub use self::str::ByteStr;
 
 mod body;
-#[doc(hidden)]
-pub mod buf;
 mod chunk;
 mod conn;
 mod io;
 mod h1;
 //mod h2;
+mod str;
 
 /*
 macro_rules! nonblocking {
@@ -82,7 +83,7 @@ impl fmt::Display for RawStatus {
 
 impl From<StatusCode> for RawStatus {
     fn from(status: StatusCode) -> RawStatus {
-        RawStatus(status.to_u16(), Cow::Borrowed(status.canonical_reason().unwrap_or("")))
+        RawStatus(status.into(), Cow::Borrowed(status.canonical_reason().unwrap_or("")))
     }
 }
 
@@ -124,14 +125,30 @@ pub enum ClientTransaction {}
 pub trait Http1Transaction {
     type Incoming;
     type Outgoing: Default;
-    //type KeepAlive: KeepAlive;
-    fn parse(bytes: &MemBuf) -> ParseResult<Self::Incoming>;
+    fn parse(bytes: &mut BytesMut) -> ParseResult<Self::Incoming>;
     fn decoder(head: &MessageHead<Self::Incoming>) -> ::Result<h1::Decoder>;
     fn encode(head: &mut MessageHead<Self::Outgoing>, dst: &mut Vec<u8>) -> h1::Encoder;
     fn should_set_length(head: &MessageHead<Self::Outgoing>) -> bool;
 }
 
 type ParseResult<T> = ::Result<Option<(MessageHead<T>, usize)>>;
+
+struct DebugTruncate<'a>(&'a [u8]);
+
+impl<'a> fmt::Debug for DebugTruncate<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let bytes = self.0;
+        if bytes.len() > 32 {
+            try!(f.write_str("["));
+            for byte in &bytes[..32] {
+                try!(write!(f, "{:?}, ", byte));
+            }
+            write!(f, "... {}]", bytes.len())
+        } else {
+            fmt::Debug::fmt(bytes, f)
+        }
+    }
+}
 
 #[test]
 fn test_should_keep_alive() {

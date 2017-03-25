@@ -28,7 +28,7 @@ fn get_one_at_a_time(b: &mut test::Bencher) {
 
     let client = hyper::Client::new(&handle);
 
-    let url: hyper::Url = format!("http://{}/get", addr).parse().unwrap();
+    let url: hyper::Uri = format!("http://{}/get", addr).parse().unwrap();
 
     b.bytes = 160 * 2 + PHRASE.len() as u64;
     b.iter(move || {
@@ -51,7 +51,7 @@ fn post_one_at_a_time(b: &mut test::Bencher) {
 
     let client = hyper::Client::new(&handle);
 
-    let url: hyper::Url = format!("http://{}/get", addr).parse().unwrap();
+    let url: hyper::Uri = format!("http://{}/get", addr).parse().unwrap();
 
     let post = "foo bar baz quux";
     b.bytes = 180 * 2 + post.len() as u64 + PHRASE.len() as u64;
@@ -60,7 +60,7 @@ fn post_one_at_a_time(b: &mut test::Bencher) {
         req.headers_mut().set(ContentLength(post.len() as u64));
         req.set_body(post);
 
-        let work = client.get(url.clone()).and_then(|res| {
+        let work = client.request(req).and_then(|res| {
             res.body().for_each(|_chunk| {
                 Ok(())
             })
@@ -97,8 +97,8 @@ fn spawn_hello(handle: &Handle) -> SocketAddr {
     let addr = listener.local_addr().unwrap();
 
     let handle2 = handle.clone();
+    let http = hyper::server::Http::new();
     handle.spawn(listener.incoming().for_each(move |(socket, addr)| {
-        let http = hyper::server::Http::new();
         http.bind_connection(&handle2, socket, addr, Hello);
         Ok(())
     }).then(|_| Ok(())));

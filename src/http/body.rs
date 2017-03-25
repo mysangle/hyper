@@ -1,10 +1,9 @@
-use std::convert::From;
-use std::sync::Arc;
-
-use tokio_proto;
-use http::Chunk;
+use bytes::Bytes;
 use futures::{Poll, Stream};
 use futures::sync::mpsc;
+use tokio_proto;
+
+use http::Chunk;
 
 pub type TokioBody = tokio_proto::streaming::Body<Chunk, ::Error>;
 
@@ -59,14 +58,14 @@ impl From<Chunk> for Body {
     }
 }
 
-impl From<Vec<u8>> for Body {
-    fn from (vec: Vec<u8>) -> Body {
-        Body(TokioBody::from(Chunk::from(vec)))
+impl From<Bytes> for Body {
+    fn from (bytes: Bytes) -> Body {
+        Body(TokioBody::from(Chunk::from(bytes)))
     }
 }
 
-impl From<Arc<Vec<u8>>> for Body {
-    fn from (vec: Arc<Vec<u8>>) -> Body {
+impl From<Vec<u8>> for Body {
+    fn from (vec: Vec<u8>) -> Body {
         Body(TokioBody::from(Chunk::from(vec)))
     }
 }
@@ -89,9 +88,11 @@ impl From<&'static str> for Body {
     }
 }
 
-fn _assert_send() {
-    fn _assert<T: Send>() {}
+fn _assert_send_sync() {
+    fn _assert_send<T: Send>() {}
+    fn _assert_sync<T: Sync>() {}
 
-    _assert::<Body>();
-    _assert::<Chunk>();
+    _assert_send::<Body>();
+    _assert_send::<Chunk>();
+    _assert_sync::<Chunk>();
 }

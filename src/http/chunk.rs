@@ -1,36 +1,25 @@
 use std::fmt;
-use std::sync::Arc;
 
-use http::buf::MemSlice;
+use bytes::Bytes;
 
 /// A piece of a message body.
 pub struct Chunk(Inner);
 
 enum Inner {
-    Owned(Vec<u8>),
-    Referenced(Arc<Vec<u8>>),
-    Mem(MemSlice),
-    Static(&'static [u8]),
+    Shared(Bytes),
 }
 
 impl From<Vec<u8>> for Chunk {
     #[inline]
     fn from(v: Vec<u8>) -> Chunk {
-        Chunk(Inner::Owned(v))
-    }
-}
-
-impl From<Arc<Vec<u8>>> for Chunk {
-    #[inline]
-    fn from(v: Arc<Vec<u8>>) -> Chunk {
-        Chunk(Inner::Referenced(v))
+        Chunk::from(Bytes::from(v))
     }
 }
 
 impl From<&'static [u8]> for Chunk {
     #[inline]
     fn from(slice: &'static [u8]) -> Chunk {
-        Chunk(Inner::Static(slice))
+        Chunk::from(Bytes::from_static(slice))
     }
 }
 
@@ -48,9 +37,17 @@ impl From<&'static str> for Chunk {
     }
 }
 
-impl From<MemSlice> for Chunk {
-    fn from(mem: MemSlice) -> Chunk {
-        Chunk(Inner::Mem(mem))
+impl From<Bytes> for Chunk {
+    fn from(mem: Bytes) -> Chunk {
+        Chunk(Inner::Shared(mem))
+    }
+}
+
+impl From<Chunk> for Bytes {
+    fn from(chunk: Chunk) -> Bytes {
+        match chunk.0 {
+            Inner::Shared(bytes) => bytes,
+        }
     }
 }
 
@@ -67,10 +64,7 @@ impl AsRef<[u8]> for Chunk {
     #[inline]
     fn as_ref(&self) -> &[u8] {
         match self.0 {
-            Inner::Owned(ref vec) => vec,
-            Inner::Referenced(ref vec) => vec,
-            Inner::Mem(ref slice) => slice.as_ref(),
-            Inner::Static(slice) => slice,
+            Inner::Shared(ref slice) => slice,
         }
     }
 }

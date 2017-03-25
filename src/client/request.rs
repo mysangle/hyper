@@ -1,40 +1,40 @@
 use std::fmt;
 
-use Url;
-
 use header::Headers;
 use http::{Body, RequestHead};
 use method::Method;
-use uri::Uri;
+use uri::{self, Uri};
 use version::HttpVersion;
 
 /// A client request to a remote server.
-pub struct Request {
+pub struct Request<B = Body> {
     method: Method,
-    url: Url,
+    uri: Uri,
     version: HttpVersion,
     headers: Headers,
-    body: Option<Body>,
+    body: Option<B>,
+    is_proxy: bool,
 }
 
-impl Request {
+impl<B> Request<B> {
     /// Construct a new Request.
     #[inline]
-    pub fn new(method: Method, url: Url) -> Request {
+    pub fn new(method: Method, uri: Uri) -> Request<B> {
         Request {
             method: method,
-            url: url,
+            uri: uri,
             version: HttpVersion::default(),
             headers: Headers::new(),
             body: None,
+            is_proxy: false,
         }
     }
 
-    /// Read the Request Url.
+    /// Read the Request Uri.
     #[inline]
-    pub fn url(&self) -> &Url { &self.url }
+    pub fn uri(&self) -> &Uri { &self.uri }
 
-    /// Readthe Request Version.
+    /// Read the Request Version.
     #[inline]
     pub fn version(&self) -> &HttpVersion { &self.version }
 
@@ -54,9 +54,9 @@ impl Request {
     #[inline]
     pub fn headers_mut(&mut self) -> &mut Headers { &mut self.headers }
 
-    /// Set the `Url` of this request.
+    /// Set the `Uri` of this request.
     #[inline]
-    pub fn set_url(&mut self, url: Url) { self.url = url; }
+    pub fn set_uri(&mut self, uri: Uri) { self.uri = uri; }
 
     /// Set the `HttpVersion` of this request.
     #[inline]
@@ -64,22 +64,33 @@ impl Request {
 
     /// Set the body of the request.
     #[inline]
-    pub fn set_body<T: Into<Body>>(&mut self, body: T) { self.body = Some(body.into()); }
+    pub fn set_body<T: Into<B>>(&mut self, body: T) { self.body = Some(body.into()); }
+
+    /// Set that the URI should use the absolute form.
+    ///
+    /// This is only needed when talking to HTTP/1 proxies to URLs not
+    /// protected by TLS.
+    #[inline]
+    pub fn set_proxy(&mut self, is_proxy: bool) { self.is_proxy = is_proxy; }
 }
 
-impl fmt::Debug for Request {
+impl<B> fmt::Debug for Request<B> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("Request")
             .field("method", &self.method)
-            .field("url", &self.url)
+            .field("uri", &self.uri)
             .field("version", &self.version)
             .field("headers", &self.headers)
             .finish()
     }
 }
 
-pub fn split(req: Request) -> (RequestHead, Option<Body>) {
-    let uri = Uri::new(&req.url[::url::Position::BeforePath..::url::Position::AfterQuery]).expect("url is uri");
+pub fn split<B>(req: Request<B>) -> (RequestHead, Option<B>) {
+    let uri = if req.is_proxy {
+        req.uri
+    } else {
+        uri::origin_form(&req.uri)
+    };
     let head = RequestHead {
         subject: ::http::RequestLine(req.method, uri),
         headers: req.headers,
@@ -93,7 +104,7 @@ mod tests {
     /*
     use std::io::Write;
     use std::str::from_utf8;
-    use url::Url;
+    use Url;
     use method::Method::{Get, Head, Post};
     use mock::{MockStream, MockConnector};
     use net::Fresh;
@@ -196,39 +207,6 @@ mod tests {
         let request_line = "GET http://example.dom/ HTTP/1.1";
         assert_eq!(&s[..request_line.len()], request_line);
         assert!(s.contains("Host: example.dom"));
-    }
-
-    #[test]
-    fn test_post_chunked_with_encoding() {
-        let url = Url::parse("http://example.dom").unwrap();
-        let mut req = Request::with_connector(
-            Post, url, &mut MockConnector
-        ).unwrap();
-        req.headers_mut().set(TransferEncoding(vec![Encoding::Chunked]));
-        let bytes = run_request(req);
-        let s = from_utf8(&bytes[..]).unwrap();
-        assert!(!s.contains("Content-Length:"));
-        assert!(s.contains("Transfer-Encoding:"));
-    }
-
-    #[test]
-    fn test_write_error_closes() {
-        let url = Url::parse("http://hyper.rs").unwrap();
-        let req = Request::with_connector(
-            Get, url, &mut MockConnector
-        ).unwrap();
-        let mut req = req.start().unwrap();
-
-        req.message.downcast_mut::<Http11Message>().unwrap()
-            .get_mut().downcast_mut::<MockStream>().unwrap()
-            .error_on_write = true;
-
-        req.write(b"foo").unwrap();
-        assert!(req.flush().is_err());
-
-        assert!(req.message.downcast_ref::<Http11Message>().unwrap()
-            .get_ref().downcast_ref::<MockStream>().unwrap()
-            .is_closed);
     }
     */
 }

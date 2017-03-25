@@ -1,20 +1,20 @@
 use std::cmp;
 use std::fmt;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::ptr;
 
-use futures::Async;
-use tokio::io::Io;
+use tokio_io::{AsyncRead, AsyncWrite};
 
-use http::{Http1Transaction, h1, MessageHead, ParseResult};
-use http::buf::{MemBuf, MemSlice};
+use http::{Http1Transaction, h1, MessageHead, ParseResult, DebugTruncate};
+use bytes::{BytesMut, Bytes};
 
 const INIT_BUFFER_SIZE: usize = 4096;
 pub const MAX_BUFFER_SIZE: usize = 8192 + 4096 * 100;
 
 pub struct Buffered<T> {
     io: T,
-    read_buf: MemBuf,
+    read_blocked: bool,
+    read_buf: BytesMut,
     write_buf: WriteBuf,
 }
 
@@ -27,39 +27,36 @@ impl<T> fmt::Debug for Buffered<T> {
     }
 }
 
-impl<T: Io> Buffered<T> {
+impl<T: AsyncRead + AsyncWrite> Buffered<T> {
     pub fn new(io: T) -> Buffered<T> {
         Buffered {
             io: io,
-            read_buf: MemBuf::new(),
+            read_buf: BytesMut::with_capacity(0),
             write_buf: WriteBuf::new(),
+            read_blocked: false,
         }
     }
 
     pub fn read_buf(&self) -> &[u8] {
-        self.read_buf.bytes()
+        self.read_buf.as_ref()
     }
 
     pub fn consume_leading_lines(&mut self) {
         if !self.read_buf.is_empty() {
             let mut i = 0;
             while i < self.read_buf.len() {
-                match self.read_buf.bytes()[i] {
+                match self.read_buf[i] {
                     b'\r' | b'\n' => i += 1,
                     _ => break,
                 }
             }
-            self.read_buf.slice(i);
+            self.read_buf.split_to(i);
         }
-    }
-
-    pub fn poll_read(&mut self) -> Async<()> {
-        self.io.poll_read()
     }
 
     pub fn parse<S: Http1Transaction>(&mut self) -> ::Result<Option<MessageHead<S::Incoming>>> {
         self.reserve_read_buf();
-        match self.read_buf.read_from(&mut self.io) {
+        match self.read_from_io() {
             Ok(0) => {
                 trace!("parse eof");
                 return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "parse eof").into());
@@ -70,10 +67,9 @@ impl<T: Io> Buffered<T> {
                 _ => return Err(e.into())
             }
         }
-        match try!(parse::<S, _>(&self.read_buf)) {
+        match try!(parse::<S, _>(&mut self.read_buf)) {
             Some(head) => {
                 //trace!("parsed {} bytes out of {}", len, self.read_buf.len());
-                //self.read_buf.slice(len);
                 Ok(Some(head.0))
             },
             None => {
@@ -87,38 +83,49 @@ impl<T: Io> Buffered<T> {
         }
     }
 
+    fn read_from_io(&mut self) -> io::Result<usize> {
+        use bytes::BufMut;
+        self.read_blocked = false;
+        unsafe {
+            let n = match self.io.read(self.read_buf.bytes_mut()) {
+                Ok(n) => n,
+                Err(e) => {
+                    if e.kind() == io::ErrorKind::WouldBlock {
+                        self.read_blocked = true;
+                    }
+                    return Err(e)
+                }
+            };
+            self.read_buf.advance_mut(n);
+            Ok(n)
+        }
+    }
+
     fn reserve_read_buf(&mut self) {
+        use bytes::BufMut;
+        if self.read_buf.remaining_mut() >= INIT_BUFFER_SIZE {
+            return
+        }
         self.read_buf.reserve(INIT_BUFFER_SIZE);
+        unsafe {
+            let buf = self.read_buf.bytes_mut();
+            let len = buf.len();
+            ptr::write_bytes(buf.as_mut_ptr(), 0, len);
+        }
     }
 
-    pub fn buffer<B: AsRef<[u8]>>(&mut self, buf: B) {
-        self.write_buf.buffer(buf.as_ref());
+    pub fn buffer<B: AsRef<[u8]>>(&mut self, buf: B) -> usize {
+        self.write_buf.buffer(buf.as_ref())
     }
 
-    #[cfg(test)]
     pub fn io_mut(&mut self) -> &mut T {
         &mut self.io
     }
-}
 
-/*
-impl<T: Read> Read for Buffered<T> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        trace!("Buffered.read self={}, buf={}", self.read_buf.len(), buf.len());
-        unimplemented!()
-        /*
-        let n = try!(self.read_buf.bytes().read(buf));
-        self.read_buf.consume(n);
-        if n == 0 {
-            self.read_buf.reset();
-            self.io.read(&mut buf[n..])
-        } else {
-            Ok(n)
-        }
-        */
+    pub fn is_read_blocked(&self) -> bool {
+        self.read_blocked
     }
 }
-*/
 
 impl<T: Write> Write for Buffered<T> {
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
@@ -140,31 +147,31 @@ impl<T: Write> Write for Buffered<T> {
     }
 }
 
-fn parse<T: Http1Transaction<Incoming=I>, I>(rdr: &MemBuf) -> ParseResult<I> {
+fn parse<T: Http1Transaction<Incoming=I>, I>(rdr: &mut BytesMut) -> ParseResult<I> {
     h1::parse::<T, I>(rdr)
 }
 
 pub trait MemRead {
-    fn read_mem(&mut self, len: usize) -> io::Result<MemSlice>;
+    fn read_mem(&mut self, len: usize) -> io::Result<Bytes>;
 }
 
-impl<T: Read> MemRead for Buffered<T> {
-    fn read_mem(&mut self, len: usize) -> io::Result<MemSlice> {
+impl<T: AsyncRead + AsyncWrite> MemRead for Buffered<T> {
+    fn read_mem(&mut self, len: usize) -> io::Result<Bytes> {
         trace!("Buffered.read_mem read_buf={}, wanted={}", self.read_buf.len(), len);
         if !self.read_buf.is_empty() {
             let n = ::std::cmp::min(len, self.read_buf.len());
             trace!("Buffered.read_mem read_buf is not empty, slicing {}", n);
-            Ok(self.read_buf.slice(n))
+            Ok(self.read_buf.split_to(n).freeze())
         } else {
-            self.read_buf.reset();
-            let n = try!(self.read_buf.read_from(&mut self.io));
-            Ok(self.read_buf.slice(::std::cmp::min(len, n)))
+            self.reserve_read_buf();
+            let n = try!(self.read_from_io());
+            Ok(self.read_buf.split_to(::std::cmp::min(len, n)).freeze())
         }
     }
 }
 
 #[derive(Clone)]
-pub struct Cursor<T: AsRef<[u8]>> {
+pub struct Cursor<T> {
     bytes: T,
     pos: usize,
 }
@@ -211,16 +218,9 @@ impl<T: AsRef<[u8]>> Cursor<T> {
 
 impl<T: AsRef<[u8]>> fmt::Debug for Cursor<T> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let bytes = self.buf();
-        if bytes.len() > 32 {
-            try!(f.write_str("Cursor(["));
-            for byte in &bytes[..32] {
-                try!(write!(f, "{:?}, ", byte));
-            }
-            write!(f, "... {}])", bytes.len())
-        } else {
-            write!(f, "Cursor({:?})", &bytes)
-        }
+        f.debug_tuple("Cursor")
+            .field(&DebugTruncate(self.buf()))
+            .finish()
     }
 }
 
@@ -242,8 +242,12 @@ impl<T: Write + ::vecio::Writev> AtomicWrite for T {
 */
 impl<T: Write> AtomicWrite for T {
     fn write_atomic(&mut self, bufs: &[&[u8]]) -> io::Result<usize> {
-        let vec = bufs.concat();
-        self.write(&vec)
+        if bufs.len() == 1 {
+            self.write(bufs[0])
+        } else {
+            let vec = bufs.concat();
+            self.write(&vec)
+        }
     }
 }
 //}
@@ -290,7 +294,7 @@ impl WriteBuf {
         let mut vec = &mut self.0.bytes;
         let cap = vec.capacity();
         if cap == 0 {
-            let init = cmp::max(INIT_BUFFER_SIZE, needed);
+            let init = cmp::min(MAX_BUFFER_SIZE, cmp::max(INIT_BUFFER_SIZE, needed));
             trace!("WriteBuf reserving initial {}", init);
             vec.reserve(init);
         } else if cap < MAX_BUFFER_SIZE {
@@ -306,6 +310,18 @@ impl WriteBuf {
                 self.0.bytes.set_len(0);
             }
         }
+    }
+}
+
+#[cfg(test)]
+use std::io::Read;
+
+#[cfg(test)]
+impl<T: Read> MemRead for ::mock::AsyncIo<T> {
+    fn read_mem(&mut self, len: usize) -> io::Result<Bytes> {
+        let mut v = vec![0; len];
+        let n = try!(self.read(v.as_mut_slice()));
+        Ok(BytesMut::from(&v[..n]).freeze())
     }
 }
 

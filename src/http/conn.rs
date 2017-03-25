@@ -4,36 +4,43 @@ use std::marker::PhantomData;
 use std::time::Instant;
 
 use futures::{Poll, Async, AsyncSink, Stream, Sink, StartSend};
-use tokio::io::Io;
+use futures::task::Task;
+use tokio_io::{AsyncRead, AsyncWrite};
 use tokio_proto::streaming::pipeline::{Frame, Transport};
 
 use header::{ContentLength, TransferEncoding};
-use http::{self, Http1Transaction};
+use http::{self, Http1Transaction, DebugTruncate};
 use http::io::{Cursor, Buffered};
 use http::h1::{Encoder, Decoder};
 use version::HttpVersion;
 
 
 /// This handles a connection, which will have been established over an
-/// `Io` (like a socket), and will likely include multiple
+/// `AsyncRead + AsyncWrite` (like a socket), and will likely include multiple
 /// `Transaction`s over HTTP.
 ///
 /// The connection will determine when a message begins and ends as well as
 /// determine if this  connection can be kept alive after the message,
 /// or if it is complete.
-pub struct Conn<I, T, K = KA> {
+pub struct Conn<I, B, T, K = KA> {
     io: Buffered<I>,
-    state: State<K>,
+    state: State<B, K>,
     _marker: PhantomData<T>
 }
 
-impl<I: Io, T: Http1Transaction, K: KeepAlive> Conn<I, T, K> {
-    pub fn new(io: I, keep_alive: K) -> Conn<I, T, K> {
+impl<I, B, T, K> Conn<I, B, T, K>
+where I: AsyncRead + AsyncWrite,
+      B: AsRef<[u8]>,
+      T: Http1Transaction,
+      K: KeepAlive
+{
+    pub fn new(io: I, keep_alive: K) -> Conn<I, B, T, K> {
         Conn {
             io: Buffered::new(io),
             state: State {
                 reading: Reading::Init,
                 writing: Writing::Init,
+                read_task: None,
                 keep_alive: keep_alive,
             },
             _marker: PhantomData,
@@ -44,13 +51,6 @@ impl<I: Io, T: Http1Transaction, K: KeepAlive> Conn<I, T, K> {
         self.io.parse::<T>()
     }
 
-    fn is_read_ready(&mut self) -> bool {
-        match self.state.reading {
-            Reading::Init |
-            Reading::Body(..) => self.io.poll_read().is_ready(),
-            Reading::KeepAlive | Reading::Closed => true,
-        }
-    }
 
     fn is_read_closed(&self) -> bool {
         self.state.is_read_closed()
@@ -83,25 +83,20 @@ impl<I: Io, T: Http1Transaction, K: KeepAlive> Conn<I, T, K> {
             Ok(Some(head)) => (head.version, head),
             Ok(None) => return Ok(Async::NotReady),
             Err(e) => {
-                let must_respond_with_error = !self.state.was_idle();
-                self.state.close();
+                let must_respond_with_error = !self.state.is_idle();
+                self.state.close_read();
                 self.io.consume_leading_lines();
-                let ret = if !self.io.read_buf().is_empty() {
-                    error!("parse error ({}) with bytes: {:?}", e, self.io.read_buf());
+                let was_mid_parse = !self.io.read_buf().is_empty();
+                return if was_mid_parse {
+                    debug!("parse error ({}) with bytes: {:?}", e, self.io.read_buf());
+                    Ok(Async::Ready(Some(Frame::Error { error: e })))
+                } else if must_respond_with_error {
+                    trace!("parse error with 0 input, err = {:?}", e);
                     Ok(Async::Ready(Some(Frame::Error { error: e })))
                 } else {
-                    trace!("parse error with 0 input, err = {:?}", e);
-                    if must_respond_with_error {
-                        match e {
-                            ::Error::Io(io) => Err(io),
-                            other => Err(io::Error::new(io::ErrorKind::UnexpectedEof, other)),
-                        }
-                    } else {
-                        debug!("socket complete");
-                        Ok(Async::Ready(None))
-                    }
+                    debug!("socket complete");
+                    Ok(Async::Ready(None))
                 };
-                return ret;
             }
         };
 
@@ -110,8 +105,8 @@ impl<I: Io, T: Http1Transaction, K: KeepAlive> Conn<I, T, K> {
                 let decoder = match T::decoder(&head) {
                     Ok(d) => d,
                     Err(e) => {
-                        error!("decoder error = {:?}", e);
-                        self.state.close();
+                        debug!("decoder error = {:?}", e);
+                        self.state.close_read();
                         return Ok(Async::Ready(Some(Frame::Error { error: e })));
                     }
                 };
@@ -128,7 +123,7 @@ impl<I: Io, T: Http1Transaction, K: KeepAlive> Conn<I, T, K> {
             },
             _ => {
                 error!("unimplemented HTTP Version = {:?}", version);
-                self.state.close();
+                self.state.close_read();
                 return Ok(Async::Ready(Some(Frame::Error { error: ::Error::Version })));
             }
         }
@@ -159,6 +154,49 @@ impl<I: Io, T: Http1Transaction, K: KeepAlive> Conn<I, T, K> {
         ret
     }
 
+    fn maybe_park_read(&mut self) {
+        if !self.io.is_read_blocked() {
+            // the Io object is ready to read, which means it will never alert
+            // us that it is ready until we drain it. However, we're currently
+            // finished reading, so we need to park the task to be able to
+            // wake back up later when more reading should happen.
+            self.state.read_task = Some(::futures::task::park());
+        }
+    }
+
+    fn maybe_unpark(&mut self) {
+        // its possible that we returned NotReady from poll() without having
+        // exhausted the underlying Io. We would have done this when we
+        // determined we couldn't keep reading until we knew how writing
+        // would finish.
+        //
+        // When writing finishes, we need to wake the task up in case there
+        // is more reading that can be done, to start a new message.
+        match self.state.reading {
+            Reading::Body(..) |
+            Reading::KeepAlive => return,
+            Reading::Init |
+            Reading::Closed => (),
+        }
+
+        match self.state.writing {
+            Writing::Body(..) |
+            Writing::Ending(..) => return,
+            Writing::Init |
+            Writing::KeepAlive |
+            Writing::Closed => (),
+        }
+
+        if let Some(task) = self.state.read_task.take() {
+            task.unpark();
+        }
+    }
+
+    fn try_keep_alive(&mut self) {
+        self.state.try_keep_alive();
+        self.maybe_unpark();
+    }
+
     fn can_write_head(&self) -> bool {
         match self.state.writing {
             Writing::Init => true,
@@ -169,7 +207,17 @@ impl<I: Io, T: Http1Transaction, K: KeepAlive> Conn<I, T, K> {
     fn can_write_body(&self) -> bool {
         match self.state.writing {
             Writing::Body(..) => true,
-            _ => false
+            Writing::Init |
+            Writing::Ending(..) |
+            Writing::KeepAlive |
+            Writing::Closed => false,
+        }
+    }
+
+    fn has_queued_body(&self) -> bool {
+        match self.state.writing {
+            Writing::Body(_, Some(_)) => true,
+            _ => false,
         }
     }
 
@@ -189,7 +237,8 @@ impl<I: Io, T: Http1Transaction, K: KeepAlive> Conn<I, T, K> {
         self.state.keep_alive &= wants_keep_alive;
         let mut buf = Vec::new();
         let encoder = T::encode(&mut head, &mut buf);
-        self.io.buffer(buf);
+        //TODO: handle when there isn't enough room to buffer the head
+        assert!(self.io.buffer(buf) > 0);
         self.state.writing = if body {
             Writing::Body(encoder, None)
         } else {
@@ -199,55 +248,53 @@ impl<I: Io, T: Http1Transaction, K: KeepAlive> Conn<I, T, K> {
         Ok(AsyncSink::Ready)
     }
 
-    fn write_body(&mut self, chunk: Option<http::Chunk>) -> StartSend<Option<http::Chunk>, io::Error> {
+    fn write_body(&mut self, chunk: Option<B>) -> StartSend<Option<B>, io::Error> {
         debug_assert!(self.can_write_body());
+
+        if self.has_queued_body() {
+            try!(self.flush());
+        }
 
         let state = match self.state.writing {
             Writing::Body(ref mut encoder, ref mut queued) => {
                 if queued.is_some() {
                     return Ok(AsyncSink::NotReady(chunk));
                 }
-                let mut is_done = true;
-                let mut wbuf = Cursor::new(match chunk {
-                    Some(chunk) => {
-                        is_done = false;
-                        chunk
-                    }
-                    None => {
-                        // Encode a zero length chunk
-                        // the http1 encoder does the right thing
-                        // encoding either the final chunk or ignoring the input
-                        http::Chunk::from(Vec::new())
-                    }
-                });
+                if let Some(chunk) = chunk {
+                    let mut cursor = Cursor::new(chunk);
+                    match encoder.encode(&mut self.io, cursor.buf()) {
+                        Ok(n) => {
+                            cursor.consume(n);
 
-                match encoder.encode(&mut self.io, wbuf.buf()) {
-                    Ok(n) => {
-                        wbuf.consume(n);
-
-                        if !wbuf.is_written() {
-                            trace!("Conn::start_send frame not written, queued");
-                            *queued = Some(wbuf);
-                        }
-                    },
-                    Err(e) => match e.kind() {
-                        io::ErrorKind::WouldBlock => {
-                            trace!("Conn::start_send frame not written, queued");
-                            *queued = Some(wbuf);
+                            if !cursor.is_written() {
+                                trace!("Conn::start_send frame not written, queued");
+                                *queued = Some(cursor);
+                            }
                         },
-                        _ => return Err(e)
+                        Err(e) => match e.kind() {
+                            io::ErrorKind::WouldBlock => {
+                                trace!("Conn::start_send frame not written, queued");
+                                *queued = Some(cursor);
+                            },
+                            _ => return Err(e)
+                        }
                     }
-                }
 
-                if encoder.is_eof() {
-                    Writing::KeepAlive
-                } else if is_done {
-                    Writing::Closed
+                    if encoder.is_eof() {
+                        Writing::KeepAlive
+                    } else {
+                        return Ok(AsyncSink::Ready);
+                    }
                 } else {
-                    return Ok(AsyncSink::Ready);
+                    // end of stream, that means we should try to eof
+                    match encoder.eof() {
+                        Ok(Some(end)) => Writing::Ending(Cursor::new(end)),
+                        Ok(None) => Writing::KeepAlive,
+                        Err(_not_eof) => Writing::Closed,
+                    }
                 }
             },
-            Writing::Init | Writing::KeepAlive | Writing::Closed => unreachable!(),
+            _ => unreachable!(),
         };
         self.state.writing = state;
         Ok(AsyncSink::Ready)
@@ -255,7 +302,7 @@ impl<I: Io, T: Http1Transaction, K: KeepAlive> Conn<I, T, K> {
 
     fn write_queued(&mut self) -> Poll<(), io::Error> {
         trace!("Conn::write_queued()");
-        match self.state.writing {
+        let state = match self.state.writing {
             Writing::Body(ref mut encoder, ref mut queued) => {
                 let complete = if let Some(chunk) = queued.as_mut() {
                     let n = try_nb!(encoder.encode(&mut self.io, chunk.buf()));
@@ -265,32 +312,46 @@ impl<I: Io, T: Http1Transaction, K: KeepAlive> Conn<I, T, K> {
                     true
                 };
                 trace!("Conn::write_queued complete = {}", complete);
-                if complete {
+                return if complete {
                     *queued = None;
                     Ok(Async::Ready(()))
                 } else {
                     Ok(Async::NotReady)
+                };
+            },
+            Writing::Ending(ref mut ending) => {
+                let n = self.io.buffer(ending.buf());
+                ending.consume(n);
+                if ending.is_written() {
+                    Writing::KeepAlive
+                } else {
+                    return Ok(Async::NotReady);
                 }
             },
-            _ => Ok(Async::Ready(())),
-        }
+            _ => return Ok(Async::Ready(())),
+        };
+        self.state.writing = state;
+        Ok(Async::Ready(()))
     }
 
     fn flush(&mut self) -> Poll<(), io::Error> {
-        let ret = try!(self.write_queued());
-        try_nb!(self.io.flush());
-        self.state.try_keep_alive();
-        trace!("flushed {:?}", self.state);
-        if self.is_read_ready() {
-            ::futures::task::park().unpark();
+        loop {
+            let queue_finished = try!(self.write_queued()).is_ready();
+            try_nb!(self.io.flush());
+            if queue_finished {
+                break;
+            }
         }
-        Ok(ret)
+        self.try_keep_alive();
+        trace!("flushed {:?}", self.state);
+        Ok(Async::Ready(()))
 
     }
 }
 
-impl<I, T, K> Stream for Conn<I, T, K>
-where I: Io,
+impl<I, B, T, K> Stream for Conn<I, B, T, K>
+where I: AsyncRead + AsyncWrite,
+      B: AsRef<[u8]>,
       T: Http1Transaction,
       K: KeepAlive,
       T::Outgoing: fmt::Debug {
@@ -299,6 +360,7 @@ where I: Io,
 
     fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
         trace!("Conn::poll()");
+        self.state.read_task.take();
 
         if self.is_read_closed() {
             trace!("Conn::poll when closed");
@@ -310,19 +372,25 @@ where I: Io,
                 .map(|async| async.map(|chunk| Some(Frame::Body {
                     chunk: chunk
                 })))
+                .or_else(|err| {
+                    self.state.close_read();
+                    Ok(Async::Ready(Some(Frame::Error { error: err.into() })))
+                })
         } else {
             trace!("poll when on keep-alive");
+            self.maybe_park_read();
             Ok(Async::NotReady)
         }
     }
 }
 
-impl<I, T, K> Sink for Conn<I, T, K>
-where I: Io,
+impl<I, B, T, K> Sink for Conn<I, B, T, K>
+where I: AsyncRead + AsyncWrite,
+      B: AsRef<[u8]>,
       T: Http1Transaction,
       K: KeepAlive,
       T::Outgoing: fmt::Debug {
-    type SinkItem = Frame<http::MessageHead<T::Outgoing>, http::Chunk, ::Error>;
+    type SinkItem = Frame<http::MessageHead<T::Outgoing>, B, ::Error>;
     type SinkError = io::Error;
 
     fn start_send(&mut self, frame: Self::SinkItem) -> StartSend<Self::SinkItem, Self::SinkError> {
@@ -371,7 +439,7 @@ where I: Io,
             },
         };
 
-        error!("writing illegal frame; state={:?}, frame={:?}", self.state.writing, frame);
+        error!("writing illegal frame; state={:?}, frame={:?}", self.state.writing, DebugFrame(&frame));
         Err(io::Error::new(io::ErrorKind::InvalidInput, "illegal frame"))
 
     }
@@ -382,15 +450,21 @@ where I: Io,
         trace!("Conn::flush = {:?}", ret);
         ret
     }
+
+    fn close(&mut self) -> Poll<(), Self::SinkError> {
+        try_ready!(self.poll_complete());
+        self.io.io_mut().shutdown()
+    }
 }
 
-impl<I, T, K> Transport for Conn<I, T, K>
-where I: Io + 'static,
+impl<I, B, T, K> Transport for Conn<I, B, T, K>
+where I: AsyncRead + AsyncWrite + 'static,
+      B: AsRef<[u8]> + 'static,
       T: Http1Transaction + 'static,
       K: KeepAlive + 'static,
       T::Outgoing: fmt::Debug {}
 
-impl<I, T, K: fmt::Debug> fmt::Debug for Conn<I, T, K> {
+impl<I, B: AsRef<[u8]>, T, K: fmt::Debug> fmt::Debug for Conn<I, B, T, K> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("Conn")
             .field("state", &self.state)
@@ -399,10 +473,10 @@ impl<I, T, K: fmt::Debug> fmt::Debug for Conn<I, T, K> {
     }
 }
 
-#[derive(Debug)]
-struct State<K> {
+struct State<B, K> {
     reading: Reading,
-    writing: Writing,
+    writing: Writing<B>,
+    read_task: Option<Task>,
     keep_alive: K,
 }
 
@@ -414,12 +488,40 @@ enum Reading {
     Closed,
 }
 
-#[derive(Debug)]
-enum Writing {
+enum Writing<B> {
     Init,
-    Body(Encoder, Option<Cursor<http::Chunk>>),
+    Body(Encoder, Option<Cursor<B>>),
+    Ending(Cursor<&'static [u8]>),
     KeepAlive,
     Closed,
+}
+
+impl<B: AsRef<[u8]>, K: fmt::Debug> fmt::Debug for State<B, K> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("State")
+            .field("reading", &self.reading)
+            .field("writing", &self.writing)
+            .field("keep_alive", &self.keep_alive)
+            .field("read_task", &self.read_task)
+            .finish()
+    }
+}
+
+impl<B: AsRef<[u8]>> fmt::Debug for Writing<B> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match *self {
+            Writing::Init => f.write_str("Init"),
+            Writing::Body(ref enc, ref queued) => f.debug_tuple("Body")
+                .field(enc)
+                .field(queued)
+                .finish(),
+            Writing::Ending(ref ending) => f.debug_tuple("Ending")
+                .field(ending)
+                .finish(),
+            Writing::KeepAlive => f.write_str("KeepAlive"),
+            Writing::Closed => f.write_str("Closed"),
+        }
+    }
 }
 
 impl ::std::ops::BitAndAssign<bool> for KA {
@@ -468,7 +570,7 @@ impl KeepAlive for KA {
     }
 }
 
-impl<K: KeepAlive> State<K> {
+impl<B, K: KeepAlive> State<B, K> {
     fn close(&mut self) {
         trace!("State::close()");
         self.reading = Reading::Closed;
@@ -476,13 +578,17 @@ impl<K: KeepAlive> State<K> {
         self.keep_alive.disable();
     }
 
+    fn close_read(&mut self) {
+        trace!("State::close_read()");
+        self.reading = Reading::Closed;
+        self.keep_alive.disable();
+    }
+
     fn try_keep_alive(&mut self) {
         match (&self.reading, &self.writing) {
             (&Reading::KeepAlive, &Writing::KeepAlive) => {
                 if let KA::Busy = self.keep_alive.status() {
-                    self.reading = Reading::Init;
-                    self.writing = Writing::Init;
-                    self.keep_alive.idle();
+                    self.idle();
                 } else {
                     self.close();
                 }
@@ -495,7 +601,7 @@ impl<K: KeepAlive> State<K> {
         }
     }
 
-    fn was_idle(&self) -> bool {
+    fn is_idle(&self) -> bool {
         if let KA::Idle(..) = self.keep_alive.status() {
             true
         } else {
@@ -505,6 +611,12 @@ impl<K: KeepAlive> State<K> {
 
     fn busy(&mut self) {
         self.keep_alive.busy();
+    }
+
+    fn idle(&mut self) {
+        self.reading = Reading::Init;
+        self.writing = Writing::Init;
+        self.keep_alive.idle();
     }
 
     fn is_read_closed(&self) -> bool {
@@ -524,10 +636,10 @@ impl<K: KeepAlive> State<K> {
 }
 
 // The DebugFrame and DebugChunk are simple Debug implementations that allow
-// us to dump the frame into logs, wihtout logging the entirety of the bytes.
-struct DebugFrame<'a, T: fmt::Debug + 'a>(&'a Frame<http::MessageHead<T>, http::Chunk, ::Error>);
+// us to dump the frame into logs, without logging the entirety of the bytes.
+struct DebugFrame<'a, T: fmt::Debug + 'a, B: AsRef<[u8]> + 'a>(&'a Frame<http::MessageHead<T>, B, ::Error>);
 
-impl<'a, T: fmt::Debug + 'a> fmt::Debug for DebugFrame<'a, T> {
+impl<'a, T: fmt::Debug + 'a, B: AsRef<[u8]> + 'a> fmt::Debug for DebugFrame<'a, T, B> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self.0 {
             Frame::Message { ref message, ref body } => {
@@ -538,7 +650,7 @@ impl<'a, T: fmt::Debug + 'a> fmt::Debug for DebugFrame<'a, T> {
             },
             Frame::Body { chunk: Some(ref chunk) } => {
                 f.debug_struct("Body")
-                    .field("chunk", &DebugChunk(chunk))
+                    .field("chunk", &DebugTruncate(chunk.as_ref()))
                     .finish()
             },
             Frame::Body { chunk: None } => {
@@ -555,39 +667,41 @@ impl<'a, T: fmt::Debug + 'a> fmt::Debug for DebugFrame<'a, T> {
     }
 }
 
-struct DebugChunk<'a>(&'a http::Chunk);
-
-impl<'a> fmt::Debug for DebugChunk<'a> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.debug_tuple("Chunk")
-            .field(&self.0.len())
-            .finish()
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use futures::{Async, Stream, Sink};
+    use futures::{Async, Future, Stream, Sink};
+    use futures::future;
     use tokio_proto::streaming::pipeline::Frame;
 
-    use http::{MessageHead, ServerTransaction};
+    use http::{self, MessageHead, ServerTransaction};
     use http::h1::Encoder;
     use mock::AsyncIo;
 
-    use super::{Conn, Writing};
+    use super::{Conn, Reading, Writing};
     use ::uri::Uri;
+
+    use std::str::FromStr;
+
+    impl<T> Writing<T> {
+        fn is_queued(&self) -> bool {
+            match *self {
+                Writing::Body(_, Some(_)) => true,
+                _ => false,
+            }
+        }
+    }
 
     #[test]
     fn test_conn_init_read() {
         let good_message = b"GET / HTTP/1.1\r\n\r\n".to_vec();
         let len = good_message.len();
         let io = AsyncIo::new_buf(good_message, len);
-        let mut conn = Conn::<_, ServerTransaction>::new(io, Default::default());
+        let mut conn = Conn::<_, http::Chunk, ServerTransaction>::new(io, Default::default());
 
         match conn.poll().unwrap() {
             Async::Ready(Some(Frame::Message { message, body: false })) => {
                 assert_eq!(message, MessageHead {
-                    subject: ::http::RequestLine(::Get, Uri::new("/").unwrap()),
+                    subject: ::http::RequestLine(::Get, Uri::from_str("/").unwrap()),
                     .. MessageHead::default()
                 })
             },
@@ -597,23 +711,63 @@ mod tests {
 
     #[test]
     fn test_conn_parse_partial() {
-        let good_message = b"GET / HTTP/1.1\r\nHost: foo.bar\r\n\r\n".to_vec();
-        let io = AsyncIo::new_buf(good_message, 10);
-        let mut conn = Conn::<_, ServerTransaction>::new(io, Default::default());
+        let _: Result<(), ()> = future::lazy(|| {
+            let good_message = b"GET / HTTP/1.1\r\nHost: foo.bar\r\n\r\n".to_vec();
+            let io = AsyncIo::new_buf(good_message, 10);
+            let mut conn = Conn::<_, http::Chunk, ServerTransaction>::new(io, Default::default());
+            assert!(conn.poll().unwrap().is_not_ready());
+            conn.io.io_mut().block_in(50);
+            let async = conn.poll().unwrap();
+            assert!(async.is_ready());
+            match async {
+                Async::Ready(Some(Frame::Message { .. })) => (),
+                f => panic!("frame is not Message: {:?}", f),
+            }
+            Ok(())
+        }).wait();
+    }
+
+    #[test]
+    fn test_conn_init_read_eof_idle() {
+        let io = AsyncIo::new_buf(vec![], 1);
+        let mut conn = Conn::<_, http::Chunk, ServerTransaction>::new(io, Default::default());
+        conn.state.idle();
+
+        match conn.poll().unwrap() {
+            Async::Ready(None) => {},
+            other => panic!("frame is not None: {:?}", other)
+        }
+    }
+
+    #[test]
+    fn test_conn_init_read_eof_idle_partial_parse() {
+        let io = AsyncIo::new_buf(b"GET / HTTP/1.1".to_vec(), 100);
+        let mut conn = Conn::<_, http::Chunk, ServerTransaction>::new(io, Default::default());
+        conn.state.idle();
+
         assert!(conn.poll().unwrap().is_not_ready());
-        conn.io.io_mut().block_in(50);
-        let async = conn.poll().unwrap();
-        assert!(async.is_ready());
-        match async {
-            Async::Ready(Some(Frame::Message { .. })) => (),
-            f => panic!("frame is not Message: {:?}", f),
+        match conn.poll().unwrap() {
+            Async::Ready(Some(Frame::Error { .. })) => {},
+            other => panic!("frame is not Error: {:?}", other)
+        }
+    }
+
+    #[test]
+    fn test_conn_init_read_eof_busy() {
+        let io = AsyncIo::new_buf(vec![], 1);
+        let mut conn = Conn::<_, http::Chunk, ServerTransaction>::new(io, Default::default());
+        conn.state.busy();
+
+        match conn.poll().unwrap() {
+            Async::Ready(Some(Frame::Error { .. })) => {},
+            other => panic!("frame is not Error: {:?}", other)
         }
     }
 
     #[test]
     fn test_conn_closed_read() {
         let io = AsyncIo::new_buf(vec![], 0);
-        let mut conn = Conn::<_, ServerTransaction>::new(io, Default::default());
+        let mut conn = Conn::<_, http::Chunk, ServerTransaction>::new(io, Default::default());
         conn.state.close();
 
         match conn.poll().unwrap() {
@@ -624,27 +778,17 @@ mod tests {
 
     #[test]
     fn test_conn_body_write_length() {
-        extern crate pretty_env_logger;
-        use ::futures::Future;
-        let _ = pretty_env_logger::init();
-        let _: Result<(), ()> = ::futures::lazy(|| {
+        let _: Result<(), ()> = future::lazy(|| {
             let io = AsyncIo::new_buf(vec![], 0);
-            let mut conn = Conn::<_, ServerTransaction>::new(io, Default::default());
+            let mut conn = Conn::<_, http::Chunk, ServerTransaction>::new(io, Default::default());
             let max = ::http::io::MAX_BUFFER_SIZE + 4096;
             conn.state.writing = Writing::Body(Encoder::length((max * 2) as u64), None);
 
             assert!(conn.start_send(Frame::Body { chunk: Some(vec![b'a'; 1024 * 4].into()) }).unwrap().is_ready());
-            match conn.state.writing {
-                Writing::Body(_, None) => {},
-                _ => panic!("writing did not queue chunk: {:?}", conn.state.writing),
-            }
+            assert!(!conn.state.writing.is_queued());
 
             assert!(conn.start_send(Frame::Body { chunk: Some(vec![b'b'; max].into()) }).unwrap().is_ready());
-
-            match conn.state.writing {
-                Writing::Body(_, Some(_)) => {},
-                _ => panic!("writing did not queue chunk: {:?}", conn.state.writing),
-            }
+            assert!(conn.state.writing.is_queued());
 
             assert!(conn.start_send(Frame::Body { chunk: Some(vec![b'b'; 1024 * 4].into()) }).unwrap().is_not_ready());
 
@@ -653,7 +797,6 @@ mod tests {
             conn.io.io_mut().block_in(1024 * 3);
             assert!(conn.poll_complete().unwrap().is_not_ready());
             conn.io.io_mut().block_in(max * 2);
-            assert!(conn.poll_complete().unwrap().is_not_ready());
             assert!(conn.poll_complete().unwrap().is_ready());
 
             assert!(conn.start_send(Frame::Body { chunk: Some(vec![b'c'; 1024 * 4].into()) }).unwrap().is_ready());
@@ -663,10 +806,9 @@ mod tests {
 
     #[test]
     fn test_conn_body_write_chunked() {
-        use ::futures::Future;
-        let _: Result<(), ()> = ::futures::lazy(|| {
+        let _: Result<(), ()> = future::lazy(|| {
             let io = AsyncIo::new_buf(vec![], 4096);
-            let mut conn = Conn::<_, ServerTransaction>::new(io, Default::default());
+            let mut conn = Conn::<_, http::Chunk, ServerTransaction>::new(io, Default::default());
             conn.state.writing = Writing::Body(Encoder::chunked(), None);
 
             assert!(conn.start_send(Frame::Body { chunk: Some("headers".into()) }).unwrap().is_ready());
@@ -674,10 +816,84 @@ mod tests {
             Ok(())
         }).wait();
     }
+
+    #[test]
+    fn test_conn_body_flush() {
+        let _: Result<(), ()> = future::lazy(|| {
+            let io = AsyncIo::new_buf(vec![], 1024 * 1024 * 5);
+            let mut conn = Conn::<_, http::Chunk, ServerTransaction>::new(io, Default::default());
+            conn.state.writing = Writing::Body(Encoder::length(1024 * 1024), None);
+            assert!(conn.start_send(Frame::Body { chunk: Some(vec![b'a'; 1024 * 1024].into()) }).unwrap().is_ready());
+            assert!(conn.state.writing.is_queued());
+            assert!(conn.poll_complete().unwrap().is_ready());
+            assert!(!conn.state.writing.is_queued());
+
+            Ok(())
+        }).wait();
+    }
+
+    #[test]
+    fn test_conn_parking() {
+        use std::sync::Arc;
+        use futures::executor::Unpark;
+
+        struct Car {
+            permit: bool,
+        }
+        impl Unpark for Car {
+            fn unpark(&self) {
+                assert!(self.permit, "unparked without permit");
+            }
+        }
+
+        fn car(permit: bool) -> Arc<Unpark> {
+            Arc::new(Car {
+                permit: permit,
+            })
+        }
+
+        // test that once writing is done, unparks
+        let f = future::lazy(|| {
+            let io = AsyncIo::new_buf(vec![], 4096);
+            let mut conn = Conn::<_, http::Chunk, ServerTransaction>::new(io, Default::default());
+            conn.state.reading = Reading::KeepAlive;
+            assert!(conn.poll().unwrap().is_not_ready());
+
+            conn.state.writing = Writing::KeepAlive;
+            assert!(conn.poll_complete().unwrap().is_ready());
+            Ok::<(), ()>(())
+        });
+        ::futures::executor::spawn(f).poll_future(car(true)).unwrap();
+
+
+        // test that flushing when not waiting on read doesn't unpark
+        let f = future::lazy(|| {
+            let io = AsyncIo::new_buf(vec![], 4096);
+            let mut conn = Conn::<_, http::Chunk, ServerTransaction>::new(io, Default::default());
+            conn.state.writing = Writing::KeepAlive;
+            assert!(conn.poll_complete().unwrap().is_ready());
+            Ok::<(), ()>(())
+        });
+        ::futures::executor::spawn(f).poll_future(car(false)).unwrap();
+
+
+        // test that flushing and writing isn't done doesn't unpark
+        let f = future::lazy(|| {
+            let io = AsyncIo::new_buf(vec![], 4096);
+            let mut conn = Conn::<_, http::Chunk, ServerTransaction>::new(io, Default::default());
+            conn.state.reading = Reading::KeepAlive;
+            assert!(conn.poll().unwrap().is_not_ready());
+            conn.state.writing = Writing::Body(Encoder::length(5_000), None);
+            assert!(conn.poll_complete().unwrap().is_ready());
+            Ok::<(), ()>(())
+        });
+        ::futures::executor::spawn(f).poll_future(car(false)).unwrap();
+    }
+
     #[test]
     fn test_conn_closed_write() {
         let io = AsyncIo::new_buf(vec![], 0);
-        let mut conn = Conn::<_, ServerTransaction>::new(io, Default::default());
+        let mut conn = Conn::<_, http::Chunk, ServerTransaction>::new(io, Default::default());
         conn.state.close();
 
         match conn.start_send(Frame::Body { chunk: Some(b"foobar".to_vec().into()) }) {
