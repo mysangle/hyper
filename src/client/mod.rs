@@ -27,6 +27,7 @@ use self::pool::{Pool, Pooled};
 use uri::{self, Uri};
 
 pub use self::connect::{HttpConnector, Connect};
+pub use self::tls::HttpsConnector;
 pub use self::request::Request;
 pub use self::response::Response;
 
@@ -35,6 +36,7 @@ mod dns;
 mod pool;
 mod request;
 mod response;
+mod tls;
 
 /// A Client to make outgoing HTTP requests.
 // If the Connector is clone, then the Client can be clone easily.
