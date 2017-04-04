@@ -12,7 +12,8 @@ use futures::Future;
 use futures::stream::Stream;
 
 use hyper::Client;
-use hyper::client::HttpsConnector;
+use hyper::client::{HttpsConnector, Request};
+use hyper::Method;
 
 fn main() {
     pretty_env_logger::init().unwrap();
@@ -33,7 +34,7 @@ fn main() {
         .connector(HttpsConnector::new(4, &handle))
         .build(&handle);
 
-    let work = client.get(url).and_then(|res| {
+    let work = client.request(Request::new(Method::Get, url)).and_then(|res| {
         println!("Response: {}", res.status());
         println!("Headers: \n{}", res.headers());
 

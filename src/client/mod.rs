@@ -8,6 +8,7 @@ use std::fmt;
 use std::io;
 use std::marker::PhantomData;
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::{future, Poll, Async, Future, Stream};
@@ -27,13 +28,15 @@ use self::pool::{Pool, Pooled};
 use uri::{self, Uri};
 
 pub use self::connect::{HttpConnector, Connect};
-pub use self::tls::HttpsConnector;
+pub use self::redirect::RedirectPolicy;
 pub use self::request::Request;
 pub use self::response::Response;
+pub use self::tls::HttpsConnector;
 
 mod connect;
 mod dns;
 mod pool;
+mod redirect;
 mod request;
 mod response;
 mod tls;
@@ -42,6 +45,7 @@ mod tls;
 // If the Connector is clone, then the Client can be clone easily.
 pub struct Client<C, B = http::Body> {
     connector: C,
+    redirect_policy: Arc<Mutex<RedirectPolicy>>,
     handle: Handle,
     pool: Pool<TokioClient<B>>,
 }
@@ -90,6 +94,7 @@ impl<C, B> Client<C, B> {
     fn configured(config: Config<C, B>, handle: &Handle) -> Client<C, B> {
         Client {
             connector: config.connector,
+            redirect_policy: Arc::new(Mutex::new(RedirectPolicy::default())),
             handle: handle.clone(),
             pool: Pool::new(config.keep_alive, config.keep_alive_timeout),
         }
@@ -101,6 +106,11 @@ where C: Connect,
       B: Stream<Error=::Error> + 'static,
       B::Item: AsRef<[u8]>,
 {
+    /// Set the RedirectPolicy.
+    pub fn redirect_policy(&mut self, policy: RedirectPolicy) {
+        *self.redirect_policy.lock().unwrap() = policy;
+    }
+
     /// Send a GET Request using this Client.
     #[inline]
     pub fn get(&self, url: Uri) -> FutureResponse {
@@ -205,13 +215,13 @@ where C: Connect,
             }
         })))
     }
-
 }
 
 impl<C: Clone, B> Clone for Client<C, B> {
     fn clone(&self) -> Client<C, B> {
         Client {
             connector: self.connector.clone(),
+            redirect_policy: self.redirect_policy.clone(),
             handle: self.handle.clone(),
             pool: self.pool.clone(),
         }

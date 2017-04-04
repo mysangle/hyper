@@ -19,7 +19,9 @@ use self::Error::{
     Io,
     TooLarge,
     Incomplete,
-    Utf8
+    Utf8,
+    TooManyRedirects,
+    RedirectLoop,
 };
 
 /// Result type often returned from methods that can have hyper `Error`s.
@@ -48,6 +50,10 @@ pub enum Error {
     Io(IoError),
     /// Parsing a field as string failed
     Utf8(Utf8Error),
+    /// A request tried to redirect too many times.
+    TooManyRedirects,
+    /// An infinite redirect loop was detected.
+    RedirectLoop,
 
     #[doc(hidden)]
     __Nonexhaustive(Void)
@@ -83,6 +89,8 @@ impl StdError for Error {
             Status => "Invalid Status provided",
             Incomplete => "Message is incomplete",
             Timeout => "Timeout",
+            TooManyRedirects => "Too Many Redirects",
+            RedirectLoop => "Infinite Redirect Loop",
             Uri(ref e) => e.description(),
             Io(ref e) => e.description(),
             Utf8(ref e) => e.description(),
