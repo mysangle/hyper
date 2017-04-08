@@ -62,6 +62,8 @@ pub struct AsyncIo<T> {
     inner: T,
     bytes_until_block: usize,
     error: Option<io::Error>,
+    blocked: bool,
+    flushed: bool,
 }
 
 impl<T> AsyncIo<T> {
@@ -70,6 +72,8 @@ impl<T> AsyncIo<T> {
             inner: inner,
             bytes_until_block: bytes,
             error: None,
+            flushed: false,
+            blocked: false,
         }
     }
 
@@ -86,13 +90,23 @@ impl AsyncIo<Buf> {
     pub fn new_buf<T: Into<Vec<u8>>>(buf: T, bytes: usize) -> AsyncIo<Buf> {
         AsyncIo::new(Buf::wrap(buf.into()), bytes)
     }
+
+    pub fn flushed(&self) -> bool {
+        self.flushed
+    }
+
+    pub fn blocked(&self) -> bool {
+        self.blocked
+    }
 }
 
 impl<T: Read> Read for AsyncIo<T> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.blocked = false;
         if let Some(err) = self.error.take() {
             Err(err)
         } else if self.bytes_until_block == 0 {
+            self.blocked = true;
             Err(io::Error::new(io::ErrorKind::WouldBlock, "mock block"))
         } else {
             let n = cmp::min(self.bytes_until_block, buf.len());
@@ -111,6 +125,7 @@ impl<T: Write> Write for AsyncIo<T> {
             Err(io::Error::new(io::ErrorKind::WouldBlock, "mock block"))
         } else {
             trace!("AsyncIo::write() block_in = {}, data.len() = {}", self.bytes_until_block, data.len());
+            self.flushed = false;
             let n = cmp::min(self.bytes_until_block, data.len());
             let n = try!(self.inner.write(&data[..n]));
             self.bytes_until_block -= n;
@@ -119,6 +134,7 @@ impl<T: Write> Write for AsyncIo<T> {
     }
 
     fn flush(&mut self) -> io::Result<()> {
+        self.flushed = true;
         self.inner.flush()
     }
 }
